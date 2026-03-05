@@ -51,6 +51,15 @@ sessio kill <name>               # terminate a session
 
 Multiple clients can attach to the same session simultaneously.
 
+## Detaching from a session
+
+To disconnect from a session while keeping it running in the background:
+
+- **Raw mode (default):** press **Ctrl+]**
+- **Line mode (`--line`):** press **Ctrl+D**
+
+The session continues running after detach. Reattach with `sessio attach <name>`.
+
 ## How it works
 
 `sessio new` double-forks a daemon that owns a pty and listens on a Unix socket at `~/.sessio/<name>.sock`. Clients connect to the socket, receive a scrollback dump, then enter interactive mode.
