@@ -2,6 +2,7 @@
 """sessio - A lightweight terminal session manager."""
 
 import atexit
+import fcntl
 import os
 import pathlib
 import pty
@@ -12,8 +13,10 @@ import socket
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 
 SESSIO_DIR = pathlib.Path.home() / ".sessio"
 MAX_SCROLLBACK_CHUNKS = 10_000
@@ -23,6 +26,9 @@ HISTORY_LENGTH = 50_000
 
 TAG_OUTPUT = 0x00
 TAG_SCROLLBACK = 0x01
+TAG_WINSIZE = 0x02
+
+DETACH_KEY = 0x1D  # Ctrl+]
 
 
 # ── Wire protocol ──────────────────────────────────────────────────────
@@ -50,6 +56,19 @@ def _recv_frame(sock: socket.socket) -> bytes | None:
     if length == 0:
         return b""
     return _recv_exact(sock, length)
+
+
+def _get_terminal_size() -> tuple[int, int]:
+    """Return (rows, cols) of the current terminal."""
+    try:
+        cols, rows = os.get_terminal_size()
+        return rows, cols
+    except OSError:
+        return 24, 80
+
+
+def _pack_winsize(rows: int, cols: int) -> bytes:
+    return bytes([TAG_WINSIZE]) + struct.pack("!HH", rows, cols)
 
 
 # ── SessionServer (daemon) ─────────────────────────────────────────────
@@ -160,9 +179,24 @@ class SessionServer:
         if data is None:
             self._remove_client(client)
             return
+        # Check for winsize frame
+        if data and data[0] == TAG_WINSIZE and len(data) == 5:
+            rows, cols = struct.unpack("!HH", data[1:5])
+            self._set_winsize(rows, cols)
+            return
         # Write raw input to pty
         try:
             os.write(self.master_fd, data)
+        except OSError:
+            pass
+
+    def _set_winsize(self, rows: int, cols: int) -> None:
+        try:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            # Signal the foreground process group of the pty
+            if self.proc:
+                os.kill(self.proc.pid, signal.SIGWINCH)
         except OSError:
             pass
 
@@ -208,9 +242,125 @@ class SessionServer:
             self.pid_path.unlink()
 
 
-# ── SessionClient ──────────────────────────────────────────────────────
+# ── RawClient (default — full pty forwarding) ─────────────────────────
 
-class SessionClient:
+class RawClient:
+    """Raw-mode client: transparent pipe between user terminal and pty."""
+
+    def __init__(self, name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES):
+        self.name = name
+        self.sock_path = SESSIO_DIR / f"{name}.sock"
+        self.sock: socket.socket | None = None
+        self.scrollback_bytes = scrollback_bytes
+        self.old_termios: list | None = None
+        self.running = False
+
+    def run(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(str(self.sock_path))
+
+        # Receive scrollback
+        data = _recv_frame(self.sock)
+        if data and len(data) > 1 and data[0] == TAG_SCROLLBACK:
+            payload = data[1:]
+            if self.scrollback_bytes != 0 and payload:
+                if self.scrollback_bytes > 0 and len(payload) > self.scrollback_bytes:
+                    payload = payload[-self.scrollback_bytes:]
+                sys.stdout.buffer.write(payload)
+                sys.stdout.buffer.flush()
+
+        # Send initial terminal size
+        rows, cols = _get_terminal_size()
+        _send_frame(self.sock, _pack_winsize(rows, cols))
+
+        # Set up SIGWINCH handler
+        prev_sigwinch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, self._handle_sigwinch)
+
+        # Enter raw mode
+        stdin_fd = sys.stdin.fileno()
+        self.old_termios = termios.tcgetattr(stdin_fd)
+        self.running = True
+        try:
+            tty.setraw(stdin_fd)
+            self._raw_loop(stdin_fd)
+        finally:
+            self.running = False
+            # Restore terminal
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, self.old_termios)
+            signal.signal(signal.SIGWINCH, prev_sigwinch)
+            if self.sock:
+                try:
+                    self.sock.close()
+                except OSError:
+                    pass
+            print("\r[detached]")
+
+    def _raw_loop(self, stdin_fd: int) -> None:
+        assert self.sock is not None
+        sock_fd = self.sock.fileno()
+
+        while self.running:
+            try:
+                readable, _, _ = select.select([stdin_fd, sock_fd], [], [], 1.0)
+            except (ValueError, OSError):
+                break
+
+            for fd in readable:
+                if fd == stdin_fd:
+                    try:
+                        data = os.read(stdin_fd, 4096)
+                    except OSError:
+                        self.running = False
+                        break
+                    if not data:
+                        self.running = False
+                        break
+                    # Check for detach key (Ctrl+])
+                    if DETACH_KEY in data:
+                        # If detach key is the only byte, detach
+                        # If mixed with other data, send everything before it
+                        idx = data.index(DETACH_KEY)
+                        if idx > 0:
+                            try:
+                                _send_frame(self.sock, data[:idx])
+                            except OSError:
+                                pass
+                        self.running = False
+                        break
+                    try:
+                        _send_frame(self.sock, data)
+                    except OSError:
+                        self.running = False
+                        break
+                elif fd == sock_fd:
+                    frame = _recv_frame(self.sock)
+                    if frame is None:
+                        # Server disconnected
+                        self.running = False
+                        sys.stdout.buffer.write(b"\r\n[session ended]\r\n")
+                        sys.stdout.buffer.flush()
+                        break
+                    if len(frame) < 1:
+                        continue
+                    tag = frame[0]
+                    payload = frame[1:]
+                    if tag == TAG_OUTPUT:
+                        sys.stdout.buffer.write(payload)
+                        sys.stdout.buffer.flush()
+
+    def _handle_sigwinch(self, signum: int, frame: object) -> None:
+        if self.sock and self.running:
+            rows, cols = _get_terminal_size()
+            try:
+                _send_frame(self.sock, _pack_winsize(rows, cols))
+            except OSError:
+                pass
+
+
+# ── LineClient (legacy readline mode) ─────────────────────────────────
+
+class LineClient:
     def __init__(self, name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES):
         self.name = name
         self.sock_path = SESSIO_DIR / f"{name}.sock"
@@ -227,7 +377,6 @@ class SessionClient:
         if data and len(data) > 1 and data[0] == TAG_SCROLLBACK:
             payload = data[1:]
             if self.scrollback_bytes != 0 and payload:
-                # Trim to last scrollback_bytes (-1 means show all)
                 if self.scrollback_bytes > 0 and len(payload) > self.scrollback_bytes:
                     payload = payload[-self.scrollback_bytes:]
                 print("─── scrollback ───")
@@ -249,7 +398,6 @@ class SessionClient:
                     print("\n[detached]")
                     break
                 except KeyboardInterrupt:
-                    # Send Ctrl-C to the shell
                     if self.sock:
                         try:
                             _send_frame(self.sock, b"\x03")
@@ -308,7 +456,6 @@ def daemonize(server: SessionServer) -> None:
     """Double-fork to detach daemon process."""
     pid = os.fork()
     if pid > 0:
-        # Parent waits briefly then returns for client to attach
         return
 
     # First child
@@ -319,7 +466,6 @@ def daemonize(server: SessionServer) -> None:
         os._exit(0)
 
     # Second child — the actual daemon
-    # Redirect stdio
     log_fd = os.open(str(server.log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     devnull = os.open(os.devnull, os.O_RDONLY)
     os.dup2(devnull, 0)
@@ -328,7 +474,6 @@ def daemonize(server: SessionServer) -> None:
     os.close(devnull)
     os.close(log_fd)
 
-    # Ignore SIGHUP
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     try:
@@ -341,31 +486,27 @@ def daemonize(server: SessionServer) -> None:
 
 # ── CLI commands ───────────────────────────────────────────────────────
 
-def cmd_new(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES) -> None:
+def cmd_new(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES, line_mode: bool = False) -> None:
     SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
     pid_path = SESSIO_DIR / f"{name}.pid"
     sock_path = SESSIO_DIR / f"{name}.sock"
 
     if pid_path.exists():
-        # Check if process is actually alive
         try:
             pid = int(pid_path.read_text().strip())
             os.kill(pid, 0)
             print(f"error: session '{name}' already exists (pid {pid})", file=sys.stderr)
             sys.exit(1)
         except (ProcessLookupError, ValueError):
-            # Stale pid file, clean up
             pid_path.unlink(missing_ok=True)
             sock_path.unlink(missing_ok=True)
 
-    # Clean up stale socket
     if sock_path.exists() and not pid_path.exists():
         sock_path.unlink()
 
     server = SessionServer(name)
     daemonize(server)
 
-    # Wait for socket to appear
     for _ in range(20):
         if sock_path.exists():
             break
@@ -374,15 +515,18 @@ def cmd_new(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES) -> None
         print(f"error: daemon failed to start for '{name}'", file=sys.stderr)
         sys.exit(1)
 
-    cmd_attach(name, scrollback_bytes=scrollback_bytes)
+    cmd_attach(name, scrollback_bytes=scrollback_bytes, line_mode=line_mode)
 
 
-def cmd_attach(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES) -> None:
+def cmd_attach(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES, line_mode: bool = False) -> None:
     sock_path = SESSIO_DIR / f"{name}.sock"
     if not sock_path.exists():
         print(f"error: no session named '{name}'", file=sys.stderr)
         sys.exit(1)
-    client = SessionClient(name, scrollback_bytes=scrollback_bytes)
+    if line_mode:
+        client = LineClient(name, scrollback_bytes=scrollback_bytes)
+    else:
+        client = RawClient(name, scrollback_bytes=scrollback_bytes)
     client.run()
 
 
@@ -418,7 +562,6 @@ def cmd_kill(name: str) -> None:
         print(f"session '{name}' was already dead, cleaning up")
     except ValueError:
         print(f"error: corrupt pid file for '{name}'", file=sys.stderr)
-    # Clean up
     pid_path.unlink(missing_ok=True)
     sock_path = SESSIO_DIR / f"{name}.sock"
     sock_path.unlink(missing_ok=True)
@@ -430,13 +573,17 @@ USAGE = """\
 usage: sessio <command> [args]
 
 commands:
-  new <name> [-s BYTES]      create a new session and attach
-  attach <name> [-s BYTES]   attach to an existing session
-  list                       list active sessions
-  kill <name>                kill a session
+  new <name> [-s BYTES] [--line]    create a new session and attach
+  attach <name> [-s BYTES] [--line] attach to an existing session
+  list                              list active sessions
+  kill <name>                       kill a session
 
 options:
-  -s, --scrollback BYTES   scrollback bytes to display on attach (default: 2048, 0=none, -1=all)"""
+  -s, --scrollback BYTES   scrollback bytes on attach (default: 2048, 0=none, -1=all)
+  --line                   use line mode (readline) instead of raw mode
+
+Raw mode (default) supports TUI programs (vim, htop, claude).
+Detach with Ctrl+].  Line mode detaches with Ctrl+D."""
 
 
 def _parse_scrollback(args: list[str]) -> int:
@@ -445,6 +592,10 @@ def _parse_scrollback(args: list[str]) -> int:
             val = int(args[i + 1])
             return val if val >= 0 else -1
     return DEFAULT_SCROLLBACK_BYTES
+
+
+def _parse_line_mode(args: list[str]) -> bool:
+    return "--line" in args
 
 
 def main() -> None:
@@ -458,16 +609,18 @@ def main() -> None:
 
     if cmd == "new":
         if not rest or rest[0].startswith("-"):
-            print("usage: sessio new <name> [-s BYTES]", file=sys.stderr)
+            print("usage: sessio new <name> [-s BYTES] [--line]", file=sys.stderr)
             sys.exit(1)
         sb = _parse_scrollback(rest[1:])
-        cmd_new(rest[0], scrollback_bytes=sb)
+        line_mode = _parse_line_mode(rest[1:])
+        cmd_new(rest[0], scrollback_bytes=sb, line_mode=line_mode)
     elif cmd == "attach":
         if not rest or rest[0].startswith("-"):
-            print("usage: sessio attach <name> [-s BYTES]", file=sys.stderr)
+            print("usage: sessio attach <name> [-s BYTES] [--line]", file=sys.stderr)
             sys.exit(1)
         sb = _parse_scrollback(rest[1:])
-        cmd_attach(rest[0], scrollback_bytes=sb)
+        line_mode = _parse_line_mode(rest[1:])
+        cmd_attach(rest[0], scrollback_bytes=sb, line_mode=line_mode)
     elif cmd == "list":
         cmd_list()
     elif cmd == "kill":
