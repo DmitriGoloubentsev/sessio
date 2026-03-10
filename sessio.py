@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """sessio - A lightweight terminal session manager."""
 
-import atexit
 import fcntl
 import os
 import pathlib
@@ -18,6 +17,7 @@ import threading
 import time
 import tty
 
+VERSION = "0.1.0"
 SESSIO_DIR = pathlib.Path.home() / ".sessio"
 MAX_SCROLLBACK_CHUNKS = 10_000
 DEFAULT_SCROLLBACK_BYTES = 2048
@@ -29,6 +29,12 @@ TAG_SCROLLBACK = 0x01
 TAG_WINSIZE = 0x02
 
 DETACH_KEY = 0x1D  # Ctrl+]
+
+
+def _set_terminal_title(title: str) -> None:
+    """Emit OSC 0 to set the terminal emulator's window/tab title."""
+    sys.stdout.buffer.write(f"\x1b]0;{title}\x07".encode())
+    sys.stdout.buffer.flush()
 
 
 # ── Wire protocol ──────────────────────────────────────────────────────
@@ -79,11 +85,13 @@ class SessionServer:
         self.sock_path = SESSIO_DIR / f"{name}.sock"
         self.pid_path = SESSIO_DIR / f"{name}.pid"
         self.log_path = SESSIO_DIR / f"{name}.log"
+        self.title_path = SESSIO_DIR / f"{name}.title"
         self.scrollback: list[bytes] = []
         self.clients: list[socket.socket] = []
         self.master_fd: int = -1
         self.proc: subprocess.Popen | None = None
         self.srv_sock: socket.socket | None = None
+        self._osc_buf: bytearray | None = None  # buffer for partial OSC sequences
 
     def start(self) -> None:
         SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
@@ -150,7 +158,87 @@ class SessionServer:
         # Send scrollback dump
         dump = b"".join(self.scrollback)
         _send_frame(conn, bytes([TAG_SCROLLBACK]) + dump)
+        # Send CWD info and OSC 7 for the terminal emulator
+        if self.proc:
+            try:
+                proc_cwd = pathlib.Path(f"/proc/{self.proc.pid}/cwd")
+                if proc_cwd.exists():
+                    cwd = str(proc_cwd.resolve())
+                else:
+                    # Fallback for non-Linux (macOS, BSD)
+                    import shutil
+                    if shutil.which("lsof"):
+                        result = subprocess.run(
+                            ["lsof", "-a", "-p", str(self.proc.pid), "-d", "cwd", "-Fn"],
+                            capture_output=True, text=True, timeout=2,
+                        )
+                        cwd = None
+                        for line in result.stdout.splitlines():
+                            if line.startswith("n"):
+                                cwd = line[1:]
+                                break
+                    else:
+                        cwd = None
+                if cwd:
+                    hostname = socket.gethostname()
+                    osc7 = f"\x1b]7;file://{hostname}{cwd}\x07".encode()
+                    _send_frame(conn, bytes([TAG_OUTPUT]) + osc7)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         self.clients.append(conn)
+
+    def _extract_osc_title(self, data: bytes) -> None:
+        """Scan pty output for OSC 0/2 title sequences and save to file."""
+        for byte in data:
+            if self._osc_buf is not None:
+                buflen = len(self._osc_buf)
+                if buflen == 1:
+                    # We have ESC, expecting ]
+                    if byte == 0x5D:  # ]
+                        self._osc_buf.append(byte)
+                    else:
+                        self._osc_buf = None
+                        # This byte could be a new ESC
+                        if byte == 0x1B:
+                            self._osc_buf = bytearray([byte])
+                else:
+                    self._osc_buf.append(byte)
+                    # BEL terminates OSC
+                    if byte == 0x07:
+                        self._finish_osc_title()
+                    # ESC \ (ST) terminates OSC
+                    elif byte == 0x5C and buflen >= 2 and self._osc_buf[-2] == 0x1B:
+                        self._finish_osc_title()
+                    # Abandon if too long
+                    elif buflen > 512:
+                        self._osc_buf = None
+            elif byte == 0x1B:
+                self._osc_buf = bytearray([byte])
+
+    def _finish_osc_title(self) -> None:
+        """Parse completed OSC buffer and save title if it's OSC 0 or 2."""
+        buf = self._osc_buf
+        self._osc_buf = None
+        if buf is None:
+            return
+        # Strip terminator (BEL or ESC \)
+        if buf[-1] == 0x07:
+            content = buf[2:-1]  # skip ESC ]
+        elif buf[-2:] == b'\x1b\\':
+            content = buf[2:-2]
+        else:
+            return
+        # Check for OSC 0 or OSC 2 (both set window title)
+        try:
+            text = content.decode("utf-8", errors="replace")
+        except Exception:
+            return
+        if text.startswith("0;") or text.startswith("2;"):
+            title = text[2:]
+            try:
+                self.title_path.write_text(title)
+            except OSError:
+                pass
 
     def _read_pty(self) -> None:
         try:
@@ -159,12 +247,15 @@ class SessionServer:
             return
         if not data:
             return
+        # Extract terminal title from OSC sequences
+        self._extract_osc_title(data)
         # Store in scrollback
         self.scrollback.append(data)
         while len(self.scrollback) > MAX_SCROLLBACK_CHUNKS:
             self.scrollback.pop(0)
-        # Broadcast to clients
-        frame_data = bytes([TAG_OUTPUT]) + data
+        # Broadcast to clients, always enforcing session name as terminal title
+        osc_title = f"\x1b]0;{self.name}\x07".encode()
+        frame_data = bytes([TAG_OUTPUT]) + data + osc_title
         dead = []
         for client in self.clients:
             try:
@@ -192,11 +283,15 @@ class SessionServer:
 
     def _set_winsize(self, rows: int, cols: int) -> None:
         try:
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
-            # Signal the foreground process group of the pty
-            if self.proc:
-                os.kill(self.proc.pid, signal.SIGWINCH)
+            # Two-step resize: briefly set different cols then restore.
+            # This forces SIGWINCH even when the size hasn't changed
+            # (e.g. on re-attach). The 500ms delay prevents apps like
+            # Claude Code from debouncing the two signals into one.
+            fake = struct.pack("HHHH", rows, cols - 1, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, fake)
+            time.sleep(0.5)
+            real = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, real)
         except OSError:
             pass
 
@@ -240,6 +335,8 @@ class SessionServer:
             self.sock_path.unlink()
         if self.pid_path.exists():
             self.pid_path.unlink()
+        if self.title_path.exists():
+            self.title_path.unlink()
 
 
 # ── RawClient (default — full pty forwarding) ─────────────────────────
@@ -259,6 +356,9 @@ class RawClient:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(str(self.sock_path))
 
+        # Set terminal title to session name
+        _set_terminal_title(self.name)
+
         # Receive scrollback
         data = _recv_frame(self.sock)
         if data and len(data) > 1 and data[0] == TAG_SCROLLBACK:
@@ -268,6 +368,22 @@ class RawClient:
                     payload = payload[-self.scrollback_bytes:]
                 sys.stdout.buffer.write(payload)
                 sys.stdout.buffer.flush()
+
+        # Drain any pending frames (e.g. CWD info) before raw mode
+        self.sock.setblocking(False)
+        try:
+            while True:
+                frame = _recv_frame(self.sock)
+                if frame is None:
+                    break
+                if len(frame) > 1 and frame[0] == TAG_OUTPUT:
+                    sys.stdout.buffer.write(frame[1:])
+                    sys.stdout.buffer.flush()
+        except (BlockingIOError, OSError):
+            pass
+        self.sock.setblocking(True)
+
+        time.sleep(0.5)
 
         # Send initial terminal size
         rows, cols = _get_terminal_size()
@@ -289,6 +405,7 @@ class RawClient:
             # Restore terminal
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, self.old_termios)
             signal.signal(signal.SIGWINCH, prev_sigwinch)
+            _set_terminal_title("")  # clear title on detach
             if self.sock:
                 try:
                     self.sock.close()
@@ -372,6 +489,9 @@ class LineClient:
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.sock.connect(str(self.sock_path))
 
+        # Set terminal title to session name
+        _set_terminal_title(self.name)
+
         # Receive scrollback
         data = _recv_frame(self.sock)
         if data and len(data) > 1 and data[0] == TAG_SCROLLBACK:
@@ -382,6 +502,8 @@ class LineClient:
                 print("─── scrollback ───")
                 sys.stdout.buffer.write(payload)
                 sys.stdout.buffer.flush()
+
+        print(f"[attached: {self.name}]")
 
         self._setup_history()
 
@@ -395,6 +517,7 @@ class LineClient:
                 try:
                     line = input()
                 except EOFError:
+                    _set_terminal_title("")
                     print("\n[detached]")
                     break
                 except KeyboardInterrupt:
@@ -541,12 +664,23 @@ def cmd_list() -> None:
         try:
             pid = int(pf.read_text().strip())
             os.kill(pid, 0)
-            print(f"  {name} (pid {pid})")
+            title_path = SESSIO_DIR / f"{name}.title"
+            title = ""
+            try:
+                title = title_path.read_text().strip()
+            except (OSError, FileNotFoundError):
+                pass
+            if title:
+                print(f"  {name} (pid {pid}) — {title}")
+            else:
+                print(f"  {name} (pid {pid})")
         except (ProcessLookupError, ValueError):
             print(f"  {name} (stale)")
             pf.unlink(missing_ok=True)
             sock = SESSIO_DIR / f"{name}.sock"
             sock.unlink(missing_ok=True)
+            title = SESSIO_DIR / f"{name}.title"
+            title.unlink(missing_ok=True)
 
 
 def cmd_kill(name: str) -> None:
@@ -565,6 +699,8 @@ def cmd_kill(name: str) -> None:
     pid_path.unlink(missing_ok=True)
     sock_path = SESSIO_DIR / f"{name}.sock"
     sock_path.unlink(missing_ok=True)
+    title_path = SESSIO_DIR / f"{name}.title"
+    title_path.unlink(missing_ok=True)
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -606,6 +742,10 @@ def main() -> None:
 
     cmd = args[0]
     rest = args[1:]
+
+    if cmd in ("-v", "--version"):
+        print(f"sessio {VERSION}")
+        return
 
     if cmd == "new":
         if not rest or rest[0].startswith("-"):
