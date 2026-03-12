@@ -240,6 +240,47 @@ class SessionServer:
             except OSError:
                 pass
 
+    @staticmethod
+    def _strip_osc_title(data: bytes) -> bytes:
+        """Remove OSC 0 and OSC 2 (set title) sequences from pty output.
+
+        This prevents nested applications (e.g. Claude Code) from overriding
+        the sessio session name shown in client terminal tabs.
+        """
+        result = bytearray()
+        i = 0
+        n = len(data)
+        while i < n:
+            # Check for ESC ] (OSC start)
+            if data[i] == 0x1B and i + 1 < n and data[i + 1] == 0x5D:
+                j = i + 2
+                cmd_start = j
+                # Read OSC command number (digits)
+                while j < n and 0x30 <= data[j] <= 0x39:
+                    j += 1
+                if j < n and data[j] == 0x3B:  # semicolon after cmd number
+                    cmd_num = int(data[cmd_start:j]) if j > cmd_start else -1
+                    if cmd_num in (0, 2):
+                        # Title-setting OSC — skip until BEL or ST terminator
+                        j += 1
+                        while j < n:
+                            if data[j] == 0x07:
+                                j += 1
+                                break
+                            if data[j] == 0x1B and j + 1 < n and data[j + 1] == 0x5C:
+                                j += 2
+                                break
+                            j += 1
+                        i = j
+                        continue
+                # Not a title OSC — keep the bytes
+                result.extend(data[i:j])
+                i = j
+                continue
+            result.append(data[i])
+            i += 1
+        return bytes(result)
+
     def _read_pty(self) -> None:
         try:
             data = os.read(self.master_fd, 4096)
@@ -247,15 +288,16 @@ class SessionServer:
             return
         if not data:
             return
-        # Extract terminal title from OSC sequences
+        # Extract terminal title from OSC sequences (for `sessio list`)
         self._extract_osc_title(data)
-        # Store in scrollback
+        # Store raw data in scrollback
         self.scrollback.append(data)
         while len(self.scrollback) > MAX_SCROLLBACK_CHUNKS:
             self.scrollback.pop(0)
-        # Broadcast to clients, always enforcing session name as terminal title
+        # Strip OSC title sequences from nested apps, then append our own
+        clean_data = self._strip_osc_title(data)
         osc_title = f"\x1b]0;{self.name}\x07".encode()
-        frame_data = bytes([TAG_OUTPUT]) + data + osc_title
+        frame_data = bytes([TAG_OUTPUT]) + clean_data + osc_title
         dead = []
         for client in self.clients:
             try:
