@@ -88,6 +88,8 @@ class SessionServer:
         self.title_path = SESSIO_DIR / f"{name}.title"
         self.scrollback: list[bytes] = []
         self.clients: list[socket.socket] = []
+        self.client_winsize: dict[socket.socket, tuple[int, int]] = {}
+        self.active_client: socket.socket | None = None
         self.master_fd: int = -1
         self.proc: subprocess.Popen | None = None
         self.srv_sock: socket.socket | None = None
@@ -315,8 +317,18 @@ class SessionServer:
         # Check for winsize frame
         if data and data[0] == TAG_WINSIZE and len(data) == 5:
             rows, cols = struct.unpack("!HH", data[1:5])
-            self._set_winsize(rows, cols)
+            self.client_winsize[client] = (rows, cols)
+            # Resize pty if this is the active client (or the only one)
+            if client is self.active_client or self.active_client is None:
+                self.active_client = client
+                self._set_winsize(rows, cols)
             return
+        # Track active client — resize pty if a different client starts typing
+        if client is not self.active_client:
+            self.active_client = client
+            if client in self.client_winsize:
+                rows, cols = self.client_winsize[client]
+                self._set_winsize(rows, cols)
         # Write raw input to pty
         try:
             os.write(self.master_fd, data)
@@ -344,6 +356,9 @@ class SessionServer:
             pass
         if client in self.clients:
             self.clients.remove(client)
+        self.client_winsize.pop(client, None)
+        if self.active_client is client:
+            self.active_client = None
 
     def _purge_dead_clients(self) -> None:
         dead = []
