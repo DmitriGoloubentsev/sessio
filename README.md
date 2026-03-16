@@ -81,6 +81,20 @@ Use [Tailscale](https://tailscale.com/) for easy VPN access from mobile without 
 - **[MiniCode](https://minicode.app/)** — Android SSH terminal + code editor. Pair with sessio for persistent sessions, file editing, and stable connections from phone/tablet
 - **Termux** — works, `--line` mode recommended for mobile keyboards
 
+## Why not tmux/screen?
+
+tmux works for basic session persistence. sessio exists because of specific pain points when using Claude Code across devices:
+
+- **Terminal title conflicts** — Claude Code sets its own terminal title via OSC sequences. tmux either shows it (overriding your session name) or ignores it. sessio strips Claude's title and always shows the session name, while still capturing the title for `sessio list`.
+- **Multi-device resize** — attach from your phone (50 cols) and PC (120 cols) simultaneously. tmux forces both to the smallest size or the largest, breaking one display. sessio uses min cols across active clients but excludes stale ones after 60 seconds — put your phone down, PC expands to full width automatically.
+- **CWD tracking** — sessio extracts OSC 7 from terminal output and exposes the working directory. MiniCode uses this to sync its file tree. tmux doesn't.
+- **Built-in sandbox** — `cs myproject` launches Claude in a bwrap container with one command. Project directory is read-write, everything else is locked down. No tmux equivalent.
+- **Session resume** — sessio tracks Claude conversation UUIDs per session name. `cs myproject` resumes the right conversation automatically. With tmux you manage this yourself.
+- **SSH login menu** — shell integration lists sessions on connect. MiniCode can detect this and show a native picker. tmux needs separate tooling.
+- **Zero config** — single Python file, no `.tmux.conf`, no plugins, no key binding conflicts. `sessio install` and you're done.
+
+If you just need a persistent shell, tmux is fine. sessio is purpose-built for running Claude Code across multiple devices.
+
 ## All commands
 
 ```
