@@ -89,7 +89,9 @@ class SessionServer:
         self.scrollback: list[bytes] = []
         self.clients: list[socket.socket] = []
         self.client_winsize: dict[socket.socket, tuple[int, int]] = {}
+        self.client_last_active: dict[socket.socket, float] = {}
         self.active_client: socket.socket | None = None
+        self.current_winsize: tuple[int, int] = (24, 80)
         self.master_fd: int = -1
         self.proc: subprocess.Popen | None = None
         self.srv_sock: socket.socket | None = None
@@ -290,20 +292,30 @@ class SessionServer:
             return
         if not data:
             return
+        # Check if stale clients changed the effective size
+        if self.active_client and self.active_client in self.client_winsize:
+            rows, cols = self.client_winsize[self.active_client]
+            eff_rows, eff_cols = self._effective_winsize(rows, cols)
+            if (eff_rows, eff_cols) != self.current_winsize:
+                self._set_winsize(eff_rows, eff_cols)
         # Extract terminal title from OSC sequences (for `sessio list`)
         self._extract_osc_title(data)
         # Store raw data in scrollback
         self.scrollback.append(data)
         while len(self.scrollback) > MAX_SCROLLBACK_CHUNKS:
             self.scrollback.pop(0)
-        # Strip OSC title sequences from nested apps, then append our own
+        # Strip OSC title sequences from nested apps, then send our own
+        # as a separate frame to avoid corrupting the terminal parser if
+        # clean_data ends with an incomplete escape sequence.
         clean_data = self._strip_osc_title(data)
         osc_title = f"\x1b]0;{self.name}\x07".encode()
-        frame_data = bytes([TAG_OUTPUT]) + clean_data + osc_title
+        output_frame = bytes([TAG_OUTPUT]) + clean_data
+        title_frame = bytes([TAG_OUTPUT]) + osc_title
         dead = []
         for client in self.clients:
             try:
-                _send_frame(client, frame_data)
+                _send_frame(client, output_frame)
+                _send_frame(client, title_frame)
             except OSError:
                 dead.append(client)
         for client in dead:
@@ -314,28 +326,44 @@ class SessionServer:
         if data is None:
             self._remove_client(client)
             return
+        self.client_last_active[client] = time.monotonic()
         # Check for winsize frame
         if data and data[0] == TAG_WINSIZE and len(data) == 5:
             rows, cols = struct.unpack("!HH", data[1:5])
             self.client_winsize[client] = (rows, cols)
-            # Resize pty if this is the active client (or the only one)
-            if client is self.active_client or self.active_client is None:
-                self.active_client = client
-                self._set_winsize(rows, cols)
+            # New client becomes active; resize uses min cols from all
+            self.active_client = client
+            self._set_winsize(*self._effective_winsize(rows, cols))
             return
         # Track active client — resize pty if a different client starts typing
         if client is not self.active_client:
             self.active_client = client
             if client in self.client_winsize:
                 rows, cols = self.client_winsize[client]
-                self._set_winsize(rows, cols)
+                self._set_winsize(*self._effective_winsize(rows, cols))
         # Write raw input to pty
         try:
             os.write(self.master_fd, data)
         except OSError:
             pass
 
+    def _effective_winsize(self, rows: int, cols: int) -> tuple[int, int]:
+        """Return (rows, min_cols) — use active client's rows but the minimum
+        cols across all recently-active clients so every screen renders
+        correctly.  Clients idle for more than 60s are excluded."""
+        STALE_SECONDS = 60
+        now = time.monotonic()
+        active_cols = [
+            c
+            for client, (_, c) in self.client_winsize.items()
+            if now - self.client_last_active.get(client, now) < STALE_SECONDS
+        ]
+        if active_cols:
+            cols = min(cols, min(active_cols))
+        return rows, cols
+
     def _set_winsize(self, rows: int, cols: int) -> None:
+        self.current_winsize = (rows, cols)
         try:
             # Two-step resize: briefly set different cols then restore.
             # This forces SIGWINCH even when the size hasn't changed
@@ -357,8 +385,13 @@ class SessionServer:
         if client in self.clients:
             self.clients.remove(client)
         self.client_winsize.pop(client, None)
+        self.client_last_active.pop(client, None)
         if self.active_client is client:
             self.active_client = None
+        # Min cols may have changed — resize pty for remaining active client
+        if self.active_client and self.active_client in self.client_winsize:
+            rows, cols = self.client_winsize[self.active_client]
+            self._set_winsize(*self._effective_winsize(rows, cols))
 
     def _purge_dead_clients(self) -> None:
         dead = []
@@ -444,7 +477,13 @@ class RawClient:
 
         # Send initial terminal size
         rows, cols = _get_terminal_size()
-        _send_frame(self.sock, _pack_winsize(rows, cols))
+        try:
+            _send_frame(self.sock, _pack_winsize(rows, cols))
+        except BrokenPipeError:
+            _set_terminal_title("")
+            self.sock.close()
+            print(f"Session '{self.name}' is dead. Run: sessio kill {self.name}", file=sys.stderr)
+            return
 
         # Set up SIGWINCH handler
         prev_sigwinch = signal.getsignal(signal.SIGWINCH)
@@ -762,7 +801,9 @@ def cmd_kill(name: str) -> None:
 
 # ── Main ───────────────────────────────────────────────────────────────
 
-USAGE = """\
+USAGE = f"""\
+sessio {VERSION} — persistent terminal sessions
+
 usage: sessio <command> [args]
 
 commands:
@@ -774,6 +815,8 @@ commands:
 options:
   -s, --scrollback BYTES   scrollback bytes on attach (default: 2048, 0=none, -1=all)
   --line                   use line mode (readline) instead of raw mode
+  -h, --help               show this help
+  -v, --version            show version
 
 Raw mode (default) supports TUI programs (vim, htop, claude).
 Detach with Ctrl+].  Line mode detaches with Ctrl+D."""
@@ -794,13 +837,17 @@ def _parse_line_mode(args: list[str]) -> bool:
 def main() -> None:
     args = sys.argv[1:]
     if not args:
-        print(USAGE)
+        print("usage: sessio <command> [args]  (try 'sessio --help')", file=sys.stderr)
         sys.exit(1)
 
     cmd = args[0]
     rest = args[1:]
 
-    if cmd in ("-v", "--version"):
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+
+    if cmd in ("-v", "--version", "version"):
         print(f"sessio {VERSION}")
         return
 

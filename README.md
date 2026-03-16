@@ -115,6 +115,71 @@ In **line mode** (`--line`), the client uses readline for input, providing arrow
   <name>.title   last OSC window title (if set)
 ```
 
+## Remote access
+
+sessio is local-only by design — it uses Unix sockets, not TCP. To access your sessions remotely (e.g. from your phone), expose your machine's SSH server to the internet, then SSH in and run `sessio attach`.
+
+### Option 1: Tailscale (easiest, no ports to open)
+
+[Tailscale](https://tailscale.com/) creates a private WireGuard VPN between your devices. Install it on both your server and phone, and you get a stable IP that works across NAT, cellular, Wi-Fi changes — no port forwarding needed.
+
+```bash
+# On your server
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+
+# From your phone (install Tailscale app + any SSH client)
+ssh user@your-server-tailscale-ip
+sessio attach dev
+```
+
+### Option 2: Cloudflare Tunnel (no open ports, free tier)
+
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) exposes your SSH server through Cloudflare's network. Requires a domain name.
+
+```bash
+# On your server
+cloudflared tunnel create my-tunnel
+cloudflared tunnel route dns my-tunnel ssh.example.com
+cloudflared tunnel run my-tunnel
+
+# On your client, add to ~/.ssh/config:
+# Host ssh.example.com
+#   ProxyCommand cloudflared access ssh --hostname %h
+```
+
+### Option 3: Port forwarding + dynamic DNS
+
+If you control your router, forward port 22 (or a custom port) to your server's local IP. Use a dynamic DNS service if your public IP changes.
+
+```bash
+# From your phone
+ssh -p 2222 user@your-public-ip-or-ddns
+sessio attach dev
+```
+
+### Option 4: Reverse SSH tunnel
+
+If you have a VPS or any server with a public IP, create a reverse tunnel from your NAT'd machine:
+
+```bash
+# On your NAT'd server (runs persistently)
+ssh -R 2222:localhost:22 user@vps-with-public-ip -N
+
+# From your phone
+ssh -p 2222 user@vps-with-public-ip
+sessio attach dev
+```
+
+> **Tip:** Use [autossh](https://www.harding.motd.ca/autossh/) to keep reverse tunnels alive automatically.
+
+### Security recommendations
+
+- Use **SSH key authentication** and disable password login
+- Use a **non-standard port** to reduce scan noise
+- Consider **fail2ban** to block brute-force attempts
+- Tailscale or Cloudflare Tunnel are preferred over exposing ports directly
+
 ## Platform support
 
 - **Linux** — full support including CWD detection via `/proc`
