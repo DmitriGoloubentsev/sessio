@@ -161,6 +161,11 @@ initial winsize send and prints:
 Session 'name' is dead. Run: sessio kill name
 ```
 
+### Auto-create on attach
+
+`sessio attach <name>` auto-creates the session if it doesn't exist, making it
+idempotent. This simplifies scripts and aliases — no need to check first.
+
 ### Client disconnect
 
 On disconnect (`_remove_client`):
@@ -168,3 +173,131 @@ On disconnect (`_remove_client`):
 - `client_winsize` and `client_last_active` entries cleaned up
 - If this was the active client, `active_client` set to `None`
 - PTY resized for remaining active client (min cols may have changed)
+
+
+## OSC 7 CWD Tracking
+
+The daemon extracts OSC 7 sequences (`\e]7;file://hostname/path\a`) from PTY
+output and writes the path to `~/.sessio/<name>.cwd`. This is used by:
+
+- `sessio list` — shows CWD next to each session
+- `sessio menu` — shows CWD in the interactive picker
+- MiniCode — updates SFTP file tree to match terminal directory
+
+Shell integration (added by `sessio install`) emits OSC 7 on every prompt:
+
+```bash
+# bash
+__sessio_osc7() { printf '\e]7;file://%s%s\a' "$HOSTNAME" "$PWD"; }
+PROMPT_COMMAND="__sessio_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+```
+
+
+## Sandbox Mode (bwrap)
+
+`sessio sandbox` runs Claude Code inside a bubblewrap container with minimal
+filesystem access. Linux only (requires kernel namespaces).
+
+### What gets isolated
+
+- **Read-write**: project directory, `~/.claude` config
+- **Read-only**: system libs (`/usr`), configured tool paths
+- **Isolated**: `/home` (except above), `/tmp`, `/var`
+- **Network**: shared (not isolated)
+
+### Configuration
+
+Paths are configured in `~/.sessio/sandbox.conf` (INI format, created by
+`sessio install`). Key sections:
+
+```ini
+[sandbox]
+command = claude --dangerously-skip-permissions
+rw_paths = %(home)s/.claude
+ro_paths = %(home)s/.nvm
+           %(home)s/.local/bin
+extra_path = %(home)s/.local/bin
+env = CLAUDE_CONFIG_DIR=%(home)s/.claude
+sessions_map = %(home)s/.claude/sandbox-sessions
+```
+
+`%(home)s` expands to `$HOME`. Missing paths are silently skipped.
+
+### Session resolution (`cs <arg>`)
+
+The `cs` alias (set up by `sessio install`) maps to `sessio sandbox`:
+
+1. Existing session name → attach (reuse running session)
+2. Absolute path that exists → `name=basename(path)`, `dir=path`
+3. Otherwise → `name=arg`, `dir=cwd`
+4. No args → `name=basename(cwd)`, `dir=cwd`
+
+### Claude session resume
+
+When using Claude, sessio tracks session UUIDs in a mapping file
+(`~/.claude/sandbox-sessions`). On next launch with the same session name,
+it passes `-r <uuid>` to resume the conversation.
+
+### bwrap wrapper
+
+Sessio creates a transient wrapper script at `~/.sessio/<name>.wrapper.sh`
+that launches bwrap with the configured paths. The wrapper sets `$SHELL` and
+is passed to `sessio new`, which spawns it as the session's shell. The wrapper
+deletes itself on launch.
+
+### Requirements
+
+```bash
+sudo apt install bubblewrap    # Debian/Ubuntu
+```
+
+
+## Interactive Menu
+
+`sessio menu` provides a numbered session picker for quick access on login.
+
+### VPN gating
+
+When called with `--vpn`, only shows the menu for connections from allowed IPs:
+
+```bash
+# In .bashrc
+sessio menu --vpn 10.10.10.21,10.10.10.22
+```
+
+Non-VPN connections silently skip the menu and drop to normal shell.
+
+### Session ordering
+
+Sessions are sorted by socket mtime (most recently used first).
+
+### Selection
+
+- ≤9 sessions: single keypress (no Enter needed)
+- >9 sessions: type number + Enter
+- `q`: exit to normal shell
+
+
+## Install
+
+`sessio install` is an interactive setup wizard:
+
+1. **Binary** — symlinks `sessio.py` to `~/.local/bin/sessio` or
+   `/usr/local/bin/sessio`
+2. **Shell integration** — appends OSC 7 + `cs` alias to `~/.bashrc`/`~/.zshrc`
+3. **Sandbox config** — creates `~/.sessio/sandbox.conf` with defaults
+
+
+## File Layout
+
+```
+~/.sessio/
+  sandbox.conf             bwrap path configuration
+  <name>.sock              Unix domain socket
+  <name>.pid               daemon PID
+  <name>.log               daemon stderr
+  <name>.title             last OSC window title
+  <name>.cwd               last working directory (from OSC 7)
+  <name>.wrapper.sh        transient bwrap launcher (auto-deleted)
+  history                  shared readline history (line mode)
+```

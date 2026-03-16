@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """sessio - A lightweight terminal session manager."""
 
+import configparser
 import fcntl
 import os
 import pathlib
 import pty
 import readline
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -17,7 +19,7 @@ import threading
 import time
 import tty
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SESSIO_DIR = pathlib.Path.home() / ".sessio"
 MAX_SCROLLBACK_CHUNKS = 10_000
 DEFAULT_SCROLLBACK_BYTES = 2048
@@ -86,6 +88,7 @@ class SessionServer:
         self.pid_path = SESSIO_DIR / f"{name}.pid"
         self.log_path = SESSIO_DIR / f"{name}.log"
         self.title_path = SESSIO_DIR / f"{name}.title"
+        self.cwd_path = SESSIO_DIR / f"{name}.cwd"
         self.scrollback: list[bytes] = []
         self.clients: list[socket.socket] = []
         self.client_winsize: dict[socket.socket, tuple[int, int]] = {}
@@ -243,6 +246,20 @@ class SessionServer:
                 self.title_path.write_text(title)
             except OSError:
                 pass
+        elif text.startswith("7;"):
+            # OSC 7: CWD notification — file://hostname/path
+            uri = text[2:]
+            # Strip file://hostname prefix to get path
+            if uri.startswith("file://"):
+                path_part = uri[7:]  # remove "file://"
+                # Skip hostname (everything up to next /)
+                slash = path_part.find("/")
+                if slash >= 0:
+                    cwd = path_part[slash:]
+                    try:
+                        self.cwd_path.write_text(cwd)
+                    except OSError:
+                        pass
 
     @staticmethod
     def _strip_osc_title(data: bytes) -> bytes:
@@ -427,6 +444,8 @@ class SessionServer:
             self.pid_path.unlink()
         if self.title_path.exists():
             self.title_path.unlink()
+        if self.cwd_path.exists():
+            self.cwd_path.unlink()
 
 
 # ── RawClient (default — full pty forwarding) ─────────────────────────
@@ -740,8 +759,10 @@ def cmd_new(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES, line_mo
 def cmd_attach(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES, line_mode: bool = False) -> None:
     sock_path = SESSIO_DIR / f"{name}.sock"
     if not sock_path.exists():
-        print(f"error: no session named '{name}'", file=sys.stderr)
-        sys.exit(1)
+        # Auto-create session if it doesn't exist
+        print(f"session '{name}' not found, creating...")
+        cmd_new(name, scrollback_bytes=scrollback_bytes, line_mode=line_mode)
+        return
     if line_mode:
         client = LineClient(name, scrollback_bytes=scrollback_bytes)
     else:
@@ -766,10 +787,18 @@ def cmd_list() -> None:
                 title = title_path.read_text().strip()
             except (OSError, FileNotFoundError):
                 pass
+            cwd_path = SESSIO_DIR / f"{name}.cwd"
+            cwd = ""
+            try:
+                cwd = cwd_path.read_text().strip()
+            except (OSError, FileNotFoundError):
+                pass
+            parts = [f"  {name} (pid {pid})"]
+            if cwd:
+                parts.append(cwd)
             if title:
-                print(f"  {name} (pid {pid}) — {title}")
-            else:
-                print(f"  {name} (pid {pid})")
+                parts.append(f"— {title}")
+            print("  ".join(parts) if len(parts) > 1 else parts[0])
         except (ProcessLookupError, ValueError):
             print(f"  {name} (stale)")
             pf.unlink(missing_ok=True)
@@ -777,13 +806,16 @@ def cmd_list() -> None:
             sock.unlink(missing_ok=True)
             title = SESSIO_DIR / f"{name}.title"
             title.unlink(missing_ok=True)
+            cwd_file = SESSIO_DIR / f"{name}.cwd"
+            cwd_file.unlink(missing_ok=True)
 
 
-def cmd_kill(name: str) -> None:
+def _kill_one(name: str) -> None:
+    """Kill a single session by name and clean up its files."""
     pid_path = SESSIO_DIR / f"{name}.pid"
     if not pid_path.exists():
         print(f"error: no session named '{name}'", file=sys.stderr)
-        sys.exit(1)
+        return
     try:
         pid = int(pid_path.read_text().strip())
         os.kill(pid, signal.SIGTERM)
@@ -797,6 +829,584 @@ def cmd_kill(name: str) -> None:
     sock_path.unlink(missing_ok=True)
     title_path = SESSIO_DIR / f"{name}.title"
     title_path.unlink(missing_ok=True)
+    cwd_path = SESSIO_DIR / f"{name}.cwd"
+    cwd_path.unlink(missing_ok=True)
+
+
+def cmd_kill(names: list[str]) -> None:
+    if not names:
+        # No args — offer to kill all
+        SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
+        pid_files = sorted(SESSIO_DIR.glob("*.pid"))
+        all_names = [pf.stem for pf in pid_files]
+        if not all_names:
+            print("no active sessions")
+            return
+        print("Active sessions:")
+        for n in all_names:
+            print(f"  {n}")
+        try:
+            answer = input(f"Kill all {len(all_names)} sessions? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer.strip().lower() != "y":
+            return
+        for n in all_names:
+            _kill_one(n)
+    else:
+        for name in names:
+            _kill_one(name)
+
+
+# ── Sandbox ───────────────────────────────────────────────────────────
+
+SANDBOX_CONF = SESSIO_DIR / "sandbox.conf"
+SESSIONS_MAP = SESSIO_DIR / "claude-sessions"  # sessio-name → claude UUID
+
+DEFAULT_SANDBOX_CONF = """\
+[sandbox]
+# Command to run inside sandbox (default: claude --dangerously-skip-permissions)
+command = claude --dangerously-skip-permissions
+
+# Paths to bind read-write into sandbox (one per line, blank lines ignored)
+# %(home)s expands to $HOME
+rw_paths =
+    %(home)s/.claude
+
+# Paths to bind read-only into sandbox (missing paths silently skipped)
+ro_paths =
+    %(home)s/.nvm
+    %(home)s/.local/bin
+    %(home)s/.local/share/claude
+    %(home)s/.gitconfig
+    %(home)s/.tmux.conf
+    /opt/tools
+    /opt/boost
+
+# Extra PATH directories inside sandbox
+extra_path =
+    %(home)s/.local/bin
+
+# Environment variables to set inside sandbox (KEY=VALUE, one per line)
+env =
+    CLAUDE_CONFIG_DIR=%(home)s/.claude
+"""
+
+
+def _load_sandbox_conf() -> configparser.ConfigParser:
+    """Load sandbox.conf, creating default if missing."""
+    conf = configparser.ConfigParser(defaults={"home": str(pathlib.Path.home())})
+    if SANDBOX_CONF.exists():
+        conf.read(str(SANDBOX_CONF))
+    else:
+        conf.read_string(DEFAULT_SANDBOX_CONF)
+    if not conf.has_section("sandbox"):
+        conf.read_string(DEFAULT_SANDBOX_CONF)
+    return conf
+
+
+def _conf_lines(conf: configparser.ConfigParser, key: str) -> list[str]:
+    """Parse a multiline config value into a list of non-empty lines."""
+    raw = conf.get("sandbox", key, fallback="")
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _get_claude_uuid(name: str) -> str | None:
+    """Look up Claude session UUID for a sessio session name."""
+    try:
+        for line in SESSIONS_MAP.read_text().splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == name:
+                return parts[1]
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _set_claude_uuid(name: str, uuid: str) -> None:
+    """Store or update Claude session UUID for a sessio session name."""
+    SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
+    lines = []
+    try:
+        lines = SESSIONS_MAP.read_text().splitlines(keepends=True)
+    except FileNotFoundError:
+        pass
+    with open(SESSIONS_MAP, "w") as f:
+        replaced = False
+        for line in lines:
+            parts = line.strip().split()
+            if parts and parts[0] == name:
+                f.write(f"{name} {uuid}\n")
+                replaced = True
+            else:
+                f.write(line)
+        if not replaced:
+            f.write(f"{name} {uuid}\n")
+
+
+def _session_exists(name: str) -> bool:
+    """Check if a session is alive."""
+    pid_path = SESSIO_DIR / f"{name}.pid"
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, OSError):
+        return False
+
+
+def cmd_sandbox(args: list[str]) -> None:
+    """Launch claude in a bwrap sandbox inside a sessio session."""
+    shell_mode = "--shell" in args
+    positional = [a for a in args if not a.startswith("-")]
+
+    name_arg = positional[0] if len(positional) >= 1 else None
+    dir_arg = positional[1] if len(positional) >= 2 else None
+
+    # Resolve name and directory
+    if name_arg and _session_exists(name_arg):
+        # Existing session — just attach
+        cmd_attach(name_arg)
+        return
+
+    if name_arg and dir_arg:
+        name = name_arg
+        project_dir = os.path.abspath(dir_arg)
+    elif name_arg and os.path.isabs(name_arg) and os.path.isdir(name_arg):
+        project_dir = name_arg
+        name = os.path.basename(project_dir)
+    elif name_arg:
+        name = name_arg
+        project_dir = os.getcwd()
+    else:
+        project_dir = os.getcwd()
+        name = os.path.basename(project_dir)
+
+    if not shutil.which("bwrap"):
+        print("error: bwrap not found. Install: sudo apt install bubblewrap", file=sys.stderr)
+        sys.exit(1)
+
+    conf = _load_sandbox_conf()
+    command = "bash" if shell_mode else conf.get("sandbox", "command",
+                                                  fallback="claude --dangerously-skip-permissions")
+    rw_paths = _conf_lines(conf, "rw_paths")
+    ro_paths = _conf_lines(conf, "ro_paths")
+    extra_path = _conf_lines(conf, "extra_path")
+    env_lines = _conf_lines(conf, "env")
+
+    # Check for claude resume UUID (scoped by sessio name)
+    claude_project_dir = None
+    if not shell_mode and "claude" in command:
+        claude_project_key = project_dir.replace("/", "-")
+        claude_project_dir = str(pathlib.Path.home() / ".claude" / "projects" / claude_project_key)
+        existing_uuid = _get_claude_uuid(name)
+
+        if existing_uuid and os.path.exists(os.path.join(claude_project_dir, f"{existing_uuid}.jsonl")):
+            command = f"claude -r {existing_uuid} --dangerously-skip-permissions"
+            print(f"Session: {name} (resuming {existing_uuid})")
+        else:
+            print(f"Session: {name} (new)")
+    elif shell_mode:
+        print(f"Session: {name} (shell)")
+
+    # Build bwrap wrapper script
+    script_path = os.path.abspath(sys.argv[0])
+    wrapper_path = SESSIO_DIR / f"{name}.wrapper.sh"
+    SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
+
+    # Build bwrap command line
+    home = str(pathlib.Path.home())
+    bwrap_args = [
+        "bwrap",
+        "--ro-bind", "/usr", "/usr",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/sbin", "/sbin",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--dir", "/tmp",
+        "--dir", "/var",
+        "--symlink", "../tmp", "var/tmp",
+        "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf",
+        "--ro-bind", "/etc/ssl", "/etc/ssl",
+        "--ro-bind", "/etc/ca-certificates", "/etc/ca-certificates",
+        "--dir", f"/run/user/{os.getuid()}",
+        "--setenv", "XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}",
+        "--dir", home,
+        "--bind", project_dir, project_dir,
+        "--unshare-all",
+        "--share-net",
+        "--die-with-parent",
+        "--setenv", "HOME", home,
+        "--setenv", "PS1", f"[sandbox:{project_dir}] \\w\\$ ",
+        "--chdir", project_dir,
+    ]
+
+    # RW paths
+    for p in rw_paths:
+        if os.path.exists(p):
+            bwrap_args += ["--bind", p, p]
+
+    # RO paths
+    for p in ro_paths:
+        if os.path.exists(p):
+            bwrap_args += ["--ro-bind", p, p]
+
+    # Also bind /etc/passwd and /etc/group info via process substitution in wrapper
+    # Build PATH
+    sandbox_path = "/usr/local/bin:/usr/bin:/bin"
+    for p in extra_path:
+        if os.path.isdir(p):
+            sandbox_path = f"{p}:{sandbox_path}"
+    bwrap_args += ["--setenv", "PATH", sandbox_path]
+
+    # Extra env
+    for ev in env_lines:
+        if "=" in ev:
+            k, v = ev.split("=", 1)
+            bwrap_args += ["--setenv", k, v]
+
+    # Build the shell command that bwrap will exec
+    inner_cmd = f'exec {command}'
+
+    # Quote bwrap args for the wrapper script
+    quoted_args = " \\\n    ".join(f"'{a}'" for a in bwrap_args)
+    passwd_line = subprocess.run(["getent", "passwd", str(os.getuid())],
+                                 capture_output=True, text=True).stdout.strip()
+    group_line = subprocess.run(["getent", "group", str(os.getgid())],
+                                capture_output=True, text=True).stdout.strip()
+
+    wrapper_script = f"""#!/bin/bash
+rm -f '{wrapper_path}'
+{quoted_args} \\
+    --file 11 /etc/passwd \\
+    --file 12 /etc/group \\
+    bash -c '{inner_cmd}' \\
+    11< <(echo '{passwd_line}') \\
+    12< <(echo '{group_line}')
+STATUS=$?
+if [[ $STATUS -ne 0 ]]; then
+    echo "bwrap exited with status $STATUS. Press any key to close."
+    read -rsn1
+fi
+exit $STATUS
+"""
+    wrapper_path.write_text(wrapper_script)
+    wrapper_path.chmod(0o700)
+
+    # Launch sessio with wrapper as SHELL
+    old_shell = os.environ.get("SHELL")
+    os.environ["SHELL"] = str(wrapper_path)
+    try:
+        cmd_new(name)
+    finally:
+        if old_shell:
+            os.environ["SHELL"] = old_shell
+        else:
+            os.environ.pop("SHELL", None)
+
+    # After exit, find the most recently modified session file and update mapping
+    if claude_project_dir and not shell_mode:
+        try:
+            all_files = [f for f in os.listdir(claude_project_dir) if f.endswith(".jsonl")]
+        except FileNotFoundError:
+            all_files = []
+        if all_files:
+            latest = max(all_files,
+                         key=lambda f: os.path.getmtime(os.path.join(claude_project_dir, f)))
+            _set_claude_uuid(name, latest.replace(".jsonl", ""))
+
+
+# ── Menu ──────────────────────────────────────────────────────────────
+
+def cmd_menu(args: list[str]) -> None:
+    """Interactive session picker. Use from .bashrc for VPN login."""
+    # Parse --vpn IPs
+    vpn_ips: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--vpn" and i + 1 < len(args):
+            vpn_ips = [ip.strip() for ip in args[i + 1].split(",")]
+
+    # VPN check (skip menu if not from VPN)
+    if vpn_ips:
+        client_ip = os.environ.get("SSH_CONNECTION", "").split()[0] if os.environ.get("SSH_CONNECTION") else ""
+        if not client_ip or client_ip not in vpn_ips:
+            return
+
+    SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
+    pid_files = sorted(SESSIO_DIR.glob("*.pid"))
+
+    # Build session list with live PIDs
+    sessions: list[tuple[str, int, str]] = []  # (name, pid, cwd)
+    for pf in pid_files:
+        name = pf.stem
+        try:
+            pid = int(pf.read_text().strip())
+            os.kill(pid, 0)
+        except (ProcessLookupError, ValueError, OSError):
+            continue
+        # Get CWD
+        cwd = ""
+        cwd_path = SESSIO_DIR / f"{name}.cwd"
+        try:
+            cwd = cwd_path.read_text().strip()
+        except (OSError, FileNotFoundError):
+            pass
+        sessions.append((name, pid, cwd))
+
+    if not sessions:
+        print("No active sessions.")
+        return
+
+    # Sort by socket mtime (most recently used first)
+    sessions.sort(key=lambda s: os.path.getmtime(str(SESSIO_DIR / f"{s[0]}.sock"))
+                  if (SESSIO_DIR / f"{s[0]}.sock").exists() else 0, reverse=True)
+
+    count = len(sessions)
+    width = len(str(count))
+
+    print()
+    print("  \033[1mSessio Sessions\033[0m")
+    print()
+    for i, (name, pid, cwd) in enumerate(sessions):
+        cwd_display = f"  \033[2m{cwd}\033[0m" if cwd else ""
+        print(f"  {i + 1:>{width}}  {name:<20s}{cwd_display}")
+    print(f"  {'q':>{width}}  Exit")
+    print()
+
+    if count <= 9:
+        sys.stdout.write("  Select: ")
+        sys.stdout.flush()
+        # Single keypress mode
+        old_settings = termios.tcgetattr(sys.stdin.fileno())
+        try:
+            tty.setraw(sys.stdin.fileno())
+            while True:
+                ch = sys.stdin.read(1)
+                if ch == "q":
+                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+                    print("q")
+                    return
+                if ch.isdigit():
+                    idx = int(ch) - 1
+                    if 0 <= idx < count:
+                        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+                        print(ch)
+                        name = sessions[idx][0]
+                        os.execlp("sessio", "sessio", "attach", name)
+        finally:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+    else:
+        try:
+            choice = input("  Select: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if choice.strip() == "q":
+            return
+        try:
+            idx = int(choice.strip()) - 1
+            if 0 <= idx < count:
+                name = sessions[idx][0]
+                os.execlp("sessio", "sessio", "attach", name)
+        except ValueError:
+            pass
+        print("Invalid selection.")
+
+
+# ── Install ───────────────────────────────────────────────────────────
+
+BASHRC_BLOCK = '''
+# --- sessio shell integration ---
+__sessio_osc7() { printf '\\e]7;file://%s%s\\a' "$HOSTNAME" "$PWD"; }
+PROMPT_COMMAND="__sessio_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+alias cs='sessio sandbox'
+if [[ -n "$SSH_CONNECTION" ]] && command -v sessio &>/dev/null; then
+    echo "Available sessions:"
+    sessio list
+    echo '  Type "sessio menu" or "cs <name>" to connect'
+fi
+# --- end sessio ---
+'''
+
+ZSHRC_BLOCK = '''
+# --- sessio shell integration ---
+chpwd() { printf '\\e]7;file://%s%s\\a' "$HOST" "$PWD" }
+alias cs='sessio sandbox'
+if [[ -n "$SSH_CONNECTION" ]] && (( $+commands[sessio] )); then
+    echo "Available sessions:"
+    sessio list
+    echo '  Type "sessio menu" or "cs <name>" to connect'
+fi
+# --- end sessio ---
+'''
+
+
+def cmd_install() -> None:
+    """Install sessio to PATH and configure shell integration."""
+    src = pathlib.Path(__file__).resolve()
+
+    # 1. Copy/symlink to PATH
+    local_bin = pathlib.Path.home() / ".local" / "bin"
+    system_bin = pathlib.Path("/usr/local/bin")
+
+    print("Install sessio binary:")
+    print(f"  1  {local_bin}/sessio (user, no sudo)")
+    print(f"  2  {system_bin}/sessio (system, needs sudo)")
+    print(f"  s  Skip")
+    try:
+        choice = input("  Select [1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if choice == "1":
+        local_bin.mkdir(parents=True, exist_ok=True)
+        dest = local_bin / "sessio"
+        if dest.exists() or dest.is_symlink():
+            dest.unlink()
+        shutil.copy2(str(src), str(dest))
+        dest.chmod(0o755)
+        print(f"  Installed {dest}")
+        if str(local_bin) not in os.environ.get("PATH", ""):
+            print(f"  WARNING: {local_bin} is not in your PATH")
+    elif choice == "2":
+        dest = system_bin / "sessio"
+        try:
+            subprocess.run(["sudo", "install", "-m", "755", str(src), str(dest)], check=True)
+            print(f"  Installed {dest}")
+        except subprocess.CalledProcessError:
+            print("  Failed to install (sudo error)", file=sys.stderr)
+            return
+    else:
+        print("  Skipped.")
+
+    # 2. Shell integration
+    shell = os.environ.get("SHELL", "")
+    if "zsh" in shell:
+        rc_path = pathlib.Path.home() / ".zshrc"
+        block = ZSHRC_BLOCK
+    else:
+        rc_path = pathlib.Path.home() / ".bashrc"
+        block = BASHRC_BLOCK
+
+    print(f"\nShell integration ({rc_path}):")
+    print("  This adds: OSC 7 CWD tracking, 'cs' alias, session list on SSH login")
+
+    # Check if already installed
+    try:
+        existing = rc_path.read_text()
+        if "sessio shell integration" in existing:
+            print("  Already installed. Skipped.")
+        else:
+            try:
+                answer = input("  Add to shell rc? [Y/n]: ").strip().lower() or "y"
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if answer == "y":
+                with open(rc_path, "a") as f:
+                    f.write(block)
+                print(f"  Added to {rc_path}")
+            else:
+                print("  Skipped.")
+    except FileNotFoundError:
+        try:
+            answer = input(f"  Create {rc_path}? [Y/n]: ").strip().lower() or "y"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer == "y":
+            rc_path.write_text(block)
+            print(f"  Created {rc_path}")
+
+    # 3. Sandbox config
+    print(f"\nSandbox config ({SANDBOX_CONF}):")
+    if SANDBOX_CONF.exists():
+        print("  Already exists. Skipped.")
+    else:
+        try:
+            answer = input("  Create default config? [Y/n]: ").strip().lower() or "y"
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer == "y":
+            SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
+            SANDBOX_CONF.write_text(DEFAULT_SANDBOX_CONF)
+            print(f"  Created {SANDBOX_CONF}")
+            print("  Edit this file to configure bwrap paths for your system.")
+        else:
+            print("  Skipped.")
+
+    print("\nDone. Restart your shell or run: source " + str(rc_path))
+
+
+def cmd_uninstall() -> None:
+    """Remove sessio from PATH, shell rc, and optionally ~/.sessio."""
+    # 1. Remove binary symlinks
+    removed_bin = False
+    for bin_dir in [pathlib.Path.home() / ".local" / "bin", pathlib.Path("/usr/local/bin")]:
+        dest = bin_dir / "sessio"
+        if dest.is_symlink() or dest.exists():
+            try:
+                if bin_dir == pathlib.Path("/usr/local/bin"):
+                    subprocess.run(["sudo", "rm", "-f", str(dest)], check=True)
+                else:
+                    dest.unlink()
+                print(f"  Removed {dest}")
+                removed_bin = True
+            except (OSError, subprocess.CalledProcessError) as e:
+                print(f"  Failed to remove {dest}: {e}", file=sys.stderr)
+    if not removed_bin:
+        print("  No binary found in PATH.")
+
+    # 2. Remove shell integration block from rc files
+    for rc_path in [pathlib.Path.home() / ".bashrc", pathlib.Path.home() / ".zshrc"]:
+        if not rc_path.exists():
+            continue
+        try:
+            content = rc_path.read_text()
+        except OSError:
+            continue
+        if "--- sessio shell integration ---" not in content:
+            continue
+        # Remove the block between markers
+        lines = content.splitlines(keepends=True)
+        new_lines = []
+        skipping = False
+        for line in lines:
+            if "--- sessio shell integration ---" in line:
+                skipping = True
+                continue
+            if skipping and "--- end sessio ---" in line:
+                skipping = False
+                continue
+            if not skipping:
+                new_lines.append(line)
+        # Strip trailing blank lines left by removal
+        new_content = "".join(new_lines).rstrip("\n") + "\n"
+        rc_path.write_text(new_content)
+        print(f"  Removed shell integration from {rc_path}")
+
+    # 3. Optionally remove ~/.sessio
+    if SESSIO_DIR.exists():
+        try:
+            answer = input(f"\n  Remove {SESSIO_DIR} and all config? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer == "y":
+            import shutil as _shutil
+            _shutil.rmtree(SESSIO_DIR, ignore_errors=True)
+            print(f"  Removed {SESSIO_DIR}")
+        else:
+            print(f"  Kept {SESSIO_DIR}")
+
+    print("\nDone. Restart your shell to complete uninstall.")
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -807,10 +1417,14 @@ sessio {VERSION} — persistent terminal sessions
 usage: sessio <command> [args]
 
 commands:
-  new <name> [-s BYTES] [--line]    create a new session and attach
-  attach <name> [-s BYTES] [--line] attach to an existing session
+  new <name> [opts]                 create a new session and attach
+  attach <name> [opts]              attach to session (creates if needed)
   list                              list active sessions
-  kill <name>                       kill a session
+  kill [name...]                    kill sessions (no args = kill all)
+  sandbox [--shell] [name] [dir]    claude in bwrap sandbox (alias: cs)
+  menu [--vpn IPs]                  interactive session picker
+  install                           install to PATH and configure shell
+  uninstall                         remove from PATH, shell rc, and config
 
 options:
   -s, --scrollback BYTES   scrollback bytes on attach (default: 2048, 0=none, -1=all)
@@ -868,10 +1482,15 @@ def main() -> None:
     elif cmd == "list":
         cmd_list()
     elif cmd == "kill":
-        if len(rest) < 1:
-            print("usage: sessio kill <name>", file=sys.stderr)
-            sys.exit(1)
-        cmd_kill(rest[0])
+        cmd_kill(rest)
+    elif cmd == "sandbox":
+        cmd_sandbox(rest)
+    elif cmd == "menu":
+        cmd_menu(rest)
+    elif cmd == "install":
+        cmd_install()
+    elif cmd == "uninstall":
+        cmd_uninstall()
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)
         print(USAGE)
