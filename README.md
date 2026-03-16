@@ -4,7 +4,7 @@ Persistent terminal sessions. Pure Python, zero dependencies.
 
 Sessions survive disconnects, terminal closures, and SSH drops. Full TUI support (vim, htop, claude). Multiple clients can attach simultaneously. Connect from your phone, detach, pick up on your PC.
 
-**Full Claude Code history on any device** — start a Claude session on your PC, detach, SSH in from your phone and pick up exactly where you left off. All output stays in the scrollback buffer. No lost context, no re-running prompts. Pair with [MiniCode](https://minicode.app/) on Android for extended scroll history — MiniCode keeps hundreds of lines in an addressable buffer so you can scroll through Claude's full output on your phone.
+**Claude Code history** — detach on PC, re-attach from phone. Pair with [MiniCode](https://minicode.app/) for extended scrollback on Android.
 
 ## Quick start
 
