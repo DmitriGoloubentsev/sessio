@@ -771,6 +771,7 @@ def cmd_attach(name: str, scrollback_bytes: int = DEFAULT_SCROLLBACK_BYTES, line
 
 
 def cmd_list() -> None:
+    print(f"sessio {VERSION}")
     SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
     pid_files = sorted(SESSIO_DIR.glob("*.pid"))
     if not pid_files:
@@ -793,6 +794,15 @@ def cmd_list() -> None:
                 cwd = cwd_path.read_text().strip()
             except (OSError, FileNotFoundError):
                 pass
+            if not cwd:
+                try:
+                    child_pid = subprocess.run(
+                        ["ps", "--ppid", str(pid), "-o", "pid="],
+                        capture_output=True, text=True, timeout=2
+                    ).stdout.strip().split()[0]
+                    cwd = os.readlink(f"/proc/{child_pid}/cwd")
+                except (OSError, IndexError, subprocess.TimeoutExpired):
+                    pass
             parts = [f"  {name} (pid {pid})"]
             if cwd:
                 parts.append(cwd)
@@ -1149,13 +1159,22 @@ def cmd_menu(args: list[str]) -> None:
             os.kill(pid, 0)
         except (ProcessLookupError, ValueError, OSError):
             continue
-        # Get CWD
+        # Get CWD: try .cwd file first, fall back to /proc
         cwd = ""
         cwd_path = SESSIO_DIR / f"{name}.cwd"
         try:
             cwd = cwd_path.read_text().strip()
         except (OSError, FileNotFoundError):
             pass
+        if not cwd:
+            try:
+                child_pid = subprocess.run(
+                    ["ps", "--ppid", str(pid), "-o", "pid="],
+                    capture_output=True, text=True, timeout=2
+                ).stdout.strip().split()[0]
+                cwd = os.readlink(f"/proc/{child_pid}/cwd")
+            except (OSError, IndexError, subprocess.TimeoutExpired):
+                pass
         sessions.append((name, pid, cwd))
 
     if not sessions:
@@ -1170,7 +1189,7 @@ def cmd_menu(args: list[str]) -> None:
     width = len(str(count))
 
     print()
-    print("  \033[1mSessio Sessions\033[0m")
+    print(f"  \033[1mSessio {VERSION}\033[0m")
     print()
     for i, (name, pid, cwd) in enumerate(sessions):
         cwd_display = f"  \033[2m{cwd}\033[0m" if cwd else ""
