@@ -76,6 +76,7 @@ Use [Tailscale](https://tailscale.com/) for easy VPN access from mobile without 
 
 - **Linux** — full support including sandbox
 - **macOS / BSD** — core features work, no sandbox
+- **[MiniCode](https://minicode.app/)** — Android SSH terminal + code editor. Pair with sessio for persistent sessions, file editing, and stable connections from phone/tablet
 - **Termux** — works, `--line` mode recommended for mobile keyboards
 
 ## All commands
