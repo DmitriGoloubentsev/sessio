@@ -1376,20 +1376,30 @@ def cmd_install() -> None:
 
 def cmd_uninstall() -> None:
     """Remove sessio from PATH, shell rc, and optionally ~/.sessio."""
-    # 1. Remove binary symlinks
+    # 1. Remove binary
     removed_bin = False
-    for bin_dir in [pathlib.Path.home() / ".local" / "bin", pathlib.Path("/usr/local/bin")]:
-        dest = bin_dir / "sessio"
-        if dest.is_symlink() or dest.exists():
+    local_dest = pathlib.Path.home() / ".local" / "bin" / "sessio"
+    system_dest = pathlib.Path("/usr/local/bin/sessio")
+    if local_dest.is_symlink() or local_dest.exists():
+        try:
+            local_dest.unlink()
+            print(f"  Removed {local_dest}")
+            removed_bin = True
+        except OSError as e:
+            print(f"  Failed to remove {local_dest}: {e}", file=sys.stderr)
+    if system_dest.is_symlink() or system_dest.exists():
+        try:
+            system_dest.unlink()
+            print(f"  Removed {system_dest}")
+            removed_bin = True
+        except OSError:
+            # Need elevated privileges
             try:
-                if bin_dir == pathlib.Path("/usr/local/bin"):
-                    subprocess.run(["sudo", "rm", "-f", str(dest)], check=True)
-                else:
-                    dest.unlink()
-                print(f"  Removed {dest}")
+                subprocess.run(["sudo", "rm", "-f", str(system_dest)], check=True)
+                print(f"  Removed {system_dest}")
                 removed_bin = True
-            except (OSError, subprocess.CalledProcessError) as e:
-                print(f"  Failed to remove {dest}: {e}", file=sys.stderr)
+            except subprocess.CalledProcessError as e:
+                print(f"  Failed to remove {system_dest}: {e}", file=sys.stderr)
     if not removed_bin:
         print("  No binary found in PATH.")
 
