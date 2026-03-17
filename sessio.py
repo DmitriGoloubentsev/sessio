@@ -19,7 +19,7 @@ import threading
 import time
 import tty
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SESSIO_DIR = pathlib.Path.home() / ".sessio"
 MAX_SCROLLBACK_CHUNKS = 10_000
 DEFAULT_SCROLLBACK_BYTES = 2048
@@ -107,12 +107,15 @@ class SessionServer:
         master_fd, slave_fd = pty.openpty()
         self.master_fd = master_fd
         shell = os.environ.get("SHELL", "/bin/sh")
+        env = os.environ.copy()
+        env["SESSIO_SESSION"] = self.name
         self.proc = subprocess.Popen(
             [shell],
             stdin=slave_fd,
             stdout=slave_fd,
             stderr=slave_fd,
             preexec_fn=os.setsid,
+            env=env,
         )
         os.close(slave_fd)
 
@@ -1259,6 +1262,7 @@ if [[ -n "$SSH_CONNECTION" ]] && command -v sessio &>/dev/null; then
     sessio list
     echo '  Type "sessio menu" or "cs <name>" to connect'
 fi
+[[ -n "$SESSIO_SESSION" ]] && echo "Current sessio: $SESSIO_SESSION"
 # --- end sessio ---
 '''
 
@@ -1271,6 +1275,7 @@ if [[ -n "$SSH_CONNECTION" ]] && (( $+commands[sessio] )); then
     sessio list
     echo '  Type "sessio menu" or "cs <name>" to connect'
 fi
+[[ -n "$SESSIO_SESSION" ]] && echo "Current sessio: $SESSIO_SESSION"
 # --- end sessio ---
 '''
 
