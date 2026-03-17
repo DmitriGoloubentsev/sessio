@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """sessio - A lightweight terminal session manager."""
+from __future__ import annotations
 
 import configparser
 import fcntl
