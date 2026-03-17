@@ -1122,11 +1122,11 @@ exit $STATUS
     wrapper_path.write_text(wrapper_script)
     wrapper_path.chmod(0o700)
 
-    # Launch sessio with wrapper as SHELL
+    # Launch sessio with wrapper as SHELL (attach auto-creates if needed)
     old_shell = os.environ.get("SHELL")
     os.environ["SHELL"] = str(wrapper_path)
     try:
-        cmd_new(name)
+        cmd_attach(name)
     finally:
         if old_shell:
             os.environ["SHELL"] = old_shell
@@ -1258,12 +1258,12 @@ BASHRC_BLOCK = '''
 __sessio_osc7() { printf '\\e]7;file://%s%s\\a' "$HOSTNAME" "$PWD"; }
 PROMPT_COMMAND="__sessio_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 alias cs='sessio sandbox'
-if [[ -n "$SSH_CONNECTION" ]] && command -v sessio &>/dev/null; then
-    echo "Available sessions:"
+if [[ -z "$SESSIO_SESSION" ]] && command -v sessio &>/dev/null; then
     sessio list
     echo '  Type "sessio menu" or "cs <name>" to connect'
+elif [[ -n "$SESSIO_SESSION" ]]; then
+    echo "Current sessio: $SESSIO_SESSION"
 fi
-[[ -n "$SESSIO_SESSION" ]] && echo "Current sessio: $SESSIO_SESSION"
 # --- end sessio ---
 '''
 
@@ -1271,12 +1271,12 @@ ZSHRC_BLOCK = '''
 # --- sessio shell integration ---
 chpwd() { printf '\\e]7;file://%s%s\\a' "$HOST" "$PWD" }
 alias cs='sessio sandbox'
-if [[ -n "$SSH_CONNECTION" ]] && (( $+commands[sessio] )); then
-    echo "Available sessions:"
+if [[ -z "$SESSIO_SESSION" ]] && (( $+commands[sessio] )); then
     sessio list
     echo '  Type "sessio menu" or "cs <name>" to connect'
+elif [[ -n "$SESSIO_SESSION" ]]; then
+    echo "Current sessio: $SESSIO_SESSION"
 fi
-[[ -n "$SESSIO_SESSION" ]] && echo "Current sessio: $SESSIO_SESSION"
 # --- end sessio ---
 '''
 
@@ -1358,6 +1358,38 @@ def cmd_install() -> None:
         if answer == "y":
             rc_path.write_text(block)
             print(f"  Created {rc_path}")
+
+    # 2b. Ensure ~/.profile sources ~/.bashrc for login shells (SSH)
+    if "zsh" not in shell:
+        profile_path = pathlib.Path.home() / ".profile"
+        bash_profile_path = pathlib.Path.home() / ".bash_profile"
+        if not profile_path.exists() and not bash_profile_path.exists():
+            print(f"\nLogin shell config ({profile_path}):")
+            print("  SSH login shells read ~/.profile, not ~/.bashrc.")
+            print("  Without this, sessio greeting won't appear on SSH login.")
+            try:
+                answer = input(f"  Create {profile_path}? [Y/n]: ").strip().lower() or "y"
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if answer == "y":
+                profile_path.write_text(
+                    '# ~/.profile: executed by the command interpreter for login shells.\n'
+                    '# Source .bashrc if running bash interactively.\n'
+                    'if [ -n "$BASH_VERSION" ]; then\n'
+                    '    if [ -f "$HOME/.bashrc" ]; then\n'
+                    '        . "$HOME/.bashrc"\n'
+                    '    fi\n'
+                    'fi\n'
+                    '\n'
+                    '# set PATH so it includes user\'s private bin if it exists\n'
+                    'if [ -d "$HOME/.local/bin" ] ; then\n'
+                    '    PATH="$HOME/.local/bin:$PATH"\n'
+                    'fi\n'
+                )
+                print(f"  Created {profile_path}")
+            else:
+                print("  Skipped.")
 
     # 3. Sandbox config
     print(f"\nSandbox config ({SANDBOX_CONF}):")

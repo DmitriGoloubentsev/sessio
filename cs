@@ -182,8 +182,8 @@ exec "$SCRIPT_PATH" __bwrap__ $CLAUDE_CMD_Q $PROJECT_DIR_Q
 WRAPPER_EOF
 chmod +x "$WRAPPER"
 
-# Launch sessio with wrapper as SHELL
-SHELL="$WRAPPER" /usr/local/bin/sessio new "$SESSION_NAME"
+# Launch sessio with wrapper as SHELL (attach auto-creates if needed)
+SHELL="$WRAPPER" /usr/local/bin/sessio attach "$SESSION_NAME"
 
 # After claude exits, record session name → uuid mapping
 if ! $SHELL_MODE; then
