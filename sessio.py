@@ -164,7 +164,14 @@ class SessionServer:
             return
         # Send scrollback dump
         dump = b"".join(self.scrollback)
-        _send_frame(conn, bytes([TAG_SCROLLBACK]) + dump)
+        try:
+            _send_frame(conn, bytes([TAG_SCROLLBACK]) + dump)
+        except OSError:
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
         # Send CWD info and OSC 7 for the terminal emulator
         if self.proc:
             try:
@@ -339,7 +346,10 @@ class SessionServer:
             self._remove_client(client)
 
     def _read_client(self, client: socket.socket) -> None:
-        data = _recv_frame(client)
+        try:
+            data = _recv_frame(client)
+        except OSError:
+            data = None
         if data is None:
             self._remove_client(client)
             return
