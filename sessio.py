@@ -1255,6 +1255,7 @@ def cmd_menu(args: list[str]) -> None:
 
 BASHRC_BLOCK = '''
 # --- sessio shell integration ---
+[[ -d "$HOME/.local/bin" ]] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && PATH="$HOME/.local/bin:$PATH"
 __sessio_osc7() { printf '\\e]7;file://%s%s\\a' "$HOSTNAME" "$PWD"; }
 PROMPT_COMMAND="__sessio_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 alias cs='sessio sandbox'
@@ -1269,6 +1270,7 @@ fi
 
 ZSHRC_BLOCK = '''
 # --- sessio shell integration ---
+[[ -d "$HOME/.local/bin" ]] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]] && path=("$HOME/.local/bin" $path)
 chpwd() { printf '\\e]7;file://%s%s\\a' "$HOST" "$PWD" }
 alias cs='sessio sandbox'
 if [[ -z "$SESSIO_SESSION" ]] && (( $+commands[sessio] )); then
