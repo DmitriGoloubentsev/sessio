@@ -1283,8 +1283,20 @@ fi
 '''
 
 
-def cmd_install() -> None:
+def cmd_install(args: list[str] | None = None) -> None:
     """Install sessio to PATH and configure shell integration."""
+    auto_yes = args is not None and ("--yes" in args or "-y" in args)
+
+    def ask(prompt: str, default: str = "y") -> str:
+        if auto_yes:
+            print(f"{prompt}{default}")
+            return default
+        try:
+            return input(prompt).strip() or default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+
     src = pathlib.Path(__file__).resolve()
 
     # 1. Copy/symlink to PATH
@@ -1295,11 +1307,7 @@ def cmd_install() -> None:
     print(f"  1  {local_bin}/sessio (user, no sudo)")
     print(f"  2  {system_bin}/sessio (system, needs sudo)")
     print(f"  s  Skip")
-    try:
-        choice = input("  Select [1]: ").strip() or "1"
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
+    choice = ask("  Select [1]: ", "1")
 
     if choice == "1":
         local_bin.mkdir(parents=True, exist_ok=True)
@@ -1340,11 +1348,7 @@ def cmd_install() -> None:
         if "sessio shell integration" in existing:
             print("  Already installed. Skipped.")
         else:
-            try:
-                answer = input("  Add to shell rc? [Y/n]: ").strip().lower() or "y"
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
+            answer = ask("  Add to shell rc? [Y/n]: ", "y").lower()
             if answer == "y":
                 with open(rc_path, "a") as f:
                     f.write(block)
@@ -1352,11 +1356,7 @@ def cmd_install() -> None:
             else:
                 print("  Skipped.")
     except FileNotFoundError:
-        try:
-            answer = input(f"  Create {rc_path}? [Y/n]: ").strip().lower() or "y"
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
+        answer = ask(f"  Create {rc_path}? [Y/n]: ", "y").lower()
         if answer == "y":
             rc_path.write_text(block)
             print(f"  Created {rc_path}")
@@ -1369,11 +1369,7 @@ def cmd_install() -> None:
             print(f"\nLogin shell config ({profile_path}):")
             print("  SSH login shells read ~/.profile, not ~/.bashrc.")
             print("  Without this, sessio greeting won't appear on SSH login.")
-            try:
-                answer = input(f"  Create {profile_path}? [Y/n]: ").strip().lower() or "y"
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
+            answer = ask(f"  Create {profile_path}? [Y/n]: ", "y").lower()
             if answer == "y":
                 profile_path.write_text(
                     '# ~/.profile: executed by the command interpreter for login shells.\n'
@@ -1398,11 +1394,7 @@ def cmd_install() -> None:
     if SANDBOX_CONF.exists():
         print("  Already exists. Skipped.")
     else:
-        try:
-            answer = input("  Create default config? [Y/n]: ").strip().lower() or "y"
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
+        answer = ask("  Create default config? [Y/n]: ", "y").lower()
         if answer == "y":
             SESSIO_DIR.mkdir(mode=0o700, exist_ok=True)
             SANDBOX_CONF.write_text(DEFAULT_SANDBOX_CONF)
@@ -1498,7 +1490,7 @@ commands:
   kill [name...]                    kill sessions (no args = kill all)
   sandbox [--shell] [name] [dir]    claude in bwrap sandbox (alias: cs)
   menu [--vpn IPs]                  interactive session picker
-  install                           install to PATH and configure shell
+  install [--yes]                    install to PATH and configure shell
   uninstall                         remove from PATH, shell rc, and config
 
 options:
@@ -1563,7 +1555,7 @@ def main() -> None:
     elif cmd == "menu":
         cmd_menu(rest)
     elif cmd == "install":
-        cmd_install()
+        cmd_install(rest)
     elif cmd == "uninstall":
         cmd_uninstall()
     else:
